@@ -1,0 +1,3 @@
+green:#50dc64
+yellow:#ffd404
+red:#ff0434

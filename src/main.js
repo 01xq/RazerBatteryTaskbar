@@ -18,7 +18,7 @@ let batteryCheckInterval;
 let chargeState = false;
 
 app.whenReady().then(() => {
-    const icon = nativeImage.createFromPath(path.join(rootPath, 'src/assets/battery_0.png'));
+    const icon = nativeImage.createFromPath(path.join(rootPath, 'src/assets/battery_0.ico'));
     tray = new Tray(icon);
 
     const contextMenu = Menu.buildFromTemplate([
@@ -34,6 +34,10 @@ app.whenReady().then(() => {
     tray.setContextMenu(contextMenu);
     tray.setToolTip('Searching for device');
     tray.setTitle('Razer battery life');
+
+    tray.on("double-click", () => {
+        SetTrayDetails(tray);
+    })
 
     monitorChargeState()
 })
@@ -52,7 +56,7 @@ function SetTrayDetails(tray, chargeState) {
 function GetBatteryIconPath(val, isCharging) {
     let iconName;
     iconName = Math.floor(val/10) * 10;
-    return isCharging ? `src/assets/battery_charging.png` : `src/assets/battery_${iconName}.png`;
+    return isCharging ? `src/assets/battery_100.ico` : `src/assets/battery_${iconName}.ico`;
 }
 
 function QuitClick() {

@@ -1,4 +1,4 @@
-module.exports = {
+export default {
   packagerConfig: {
     icon: 'src/assets/battery_90.png'
   },

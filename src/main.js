@@ -1,68 +1,68 @@
-var {
-    WebUSB
-} = require('usb');
-const {
-    app,
-    Tray,
-    Menu,
-    nativeImage,
-    Notification
-} = require('electron');
-const HID = require("node-hid");
-if (require('electron-squirrel-startup')) app.quit();
+import { WebUSB } from 'usb';
+import { app, Tray, Menu, nativeImage } from 'electron';
+import electronSquirrelStartup from 'electron-squirrel-startup';
+import path from 'path';
 
-const path = require('path');
+if (electronSquirrelStartup) app.quit();
+
 const rootPath = app.getAppPath();
 let tray;
-let batteryCheckInterval;
 let chargeState = false;
+let chargeMonitorInterval;
+let deviceLock = false; // Mutex to prevent concurrent device access
 
 app.whenReady().then(() => {
     const icon = nativeImage.createFromPath(path.join(rootPath, 'src/assets/battery_0.ico'));
     tray = new Tray(icon);
 
     const contextMenu = Menu.buildFromTemplate([
-        { label: 'Quit', type: 'normal', click: QuitClick }
+        { label: 'Quit', type: 'normal', click: quitClick }
     ]);
-
-    batteryCheckInterval = setInterval(() => {
-        SetTrayDetails(tray, chargeState);
-    }, 30000);
-
-    SetTrayDetails(tray, chargeState);
 
     tray.setContextMenu(contextMenu);
     tray.setToolTip('Searching for device');
     tray.setTitle('Razer battery life');
 
     tray.on("double-click", () => {
-        SetTrayDetails(tray);
-    })
-
-    monitorChargeState()
-})
-
-function SetTrayDetails(tray, chargeState) {
-    GetBattery().then(battLife => {
-        if (battLife === 0 || battLife === undefined) return;
-
-        let assetPath = GetBatteryIconPath(battLife, chargeState);
-
-        tray.setImage(nativeImage.createFromPath(path.join(rootPath, assetPath)));
-        tray.setToolTip(battLife == 0 ? "Device disconnected" : battLife + '%');
+        refreshDeviceStatus();
     });
+
+    // Start monitoring (handles both battery and charge state)
+    monitorChargeState();
+    
+    // Initial refresh
+    refreshDeviceStatus();
+});
+
+async function refreshDeviceStatus() {
+    const status = await getDeviceStatus();
+    if (status) {
+        chargeState = status.isCharging;
+        const assetPath = getBatteryIconPath(status.batteryLevel, status.isCharging);
+        tray.setImage(nativeImage.createFromPath(path.join(rootPath, assetPath)));
+        tray.setToolTip(`${status.batteryLevel}%${status.isCharging ? ' (Charging)' : ''}`);
+    }
 }
 
-function GetBatteryIconPath(val, isCharging) {
-    let iconName;
-    iconName = Math.floor(val/10) * 10;
+async function setTrayDetails(tray, isCharging) {
+    const battLife = await getBattery();
+    if (battLife === 0 || battLife === undefined) return;
+
+    const assetPath = getBatteryIconPath(battLife, isCharging);
+
+    tray.setImage(nativeImage.createFromPath(path.join(rootPath, assetPath)));
+    tray.setToolTip(battLife === 0 ? "Device disconnected" : `${battLife}%`);
+}
+
+function getBatteryIconPath(val, isCharging) {
+    const iconName = Math.floor(val / 10) * 10;
     return isCharging ? `src/assets/battery_100.ico` : `src/assets/battery_${iconName}.ico`;
 }
 
-function QuitClick() {
-    clearInterval(batteryCheckInterval);
+function quitClick() {
+    clearInterval(chargeMonitorInterval);
     if (process.platform !== 'darwin') app.quit();
-};
+}
 
 // mouse stuff
 const RazerVendorId = 0x1532;
@@ -165,168 +165,202 @@ const RazerProducts = {
     },
 };
 
-function GetMessage(mouse) {
-    // Function that creates and returns the message to be sent to the device
-    let msg = Buffer.from([0x00, mouse.transactionId, 0x00, 0x00, 0x00, 0x02, 0x07, 0x80]);
+function getMessage(transactionId) {
+    // Function that creates and returns the message to be sent to the device for battery level
+    let msg = Buffer.from([0x00, transactionId, 0x00, 0x00, 0x00, 0x02, 0x07, 0x80]);
     let crc = 0;
 
     for (let i = 2; i < msg.length; i++) {
         crc = crc ^ msg[i];
     }
 
-    // the next 80 bytes would be storing the data to be sent, but for getting the battery no data is sent
-    msg = Buffer.concat([msg, Buffer.alloc(80)])
-
-    // the last 2 bytes would be the crc and a zero byte
+    msg = Buffer.concat([msg, Buffer.alloc(80)]);
     msg = Buffer.concat([msg, Buffer.from([crc, 0])]);
 
     return msg;
-};
-async function GetMouse() {
-    const customWebUSB = new WebUSB({
-        // This function can return a promise which allows a UI to be displayed if required
-        devicesFound: devices => {
-            // let dStr = devices.reduce((acc, d) => acc += `${d.productId}||${d.productName}\r\n`,'')
-            // new Notification({title: 'Info', body: dStr}).show()
-            return devices.find(device => RazerVendorId && RazerProducts[device.productId] != undefined)
-        }
-    });
+}
 
-    // Returns device based on injected 'devicesFound' function
+function getChargeStateMessage(transactionId) {
+    // Command 0x07, 0x84 queries charging state
+    let msg = Buffer.from([0x00, transactionId, 0x00, 0x00, 0x00, 0x02, 0x07, 0x84]);
+    let crc = 0;
+
+    for (let i = 2; i < msg.length; i++) {
+        crc = crc ^ msg[i];
+    }
+
+    msg = Buffer.concat([msg, Buffer.alloc(80)]);
+    msg = Buffer.concat([msg, Buffer.from([crc, 0])]);
+
+    return msg;
+}
+
+// Single WebUSB instance
+const customWebUSB = new WebUSB({
+    devicesFound: devices => {
+        return devices.find(device => 
+            device.vendorId === RazerVendorId && RazerProducts[device.productId] !== undefined
+        );
+    }
+});
+
+async function getMouse() {
     const device = await customWebUSB.requestDevice({
-        filters: [{}]
-    })
+        filters: [{ vendorId: RazerVendorId }]
+    });
 
     if (device) {
         return device;
-    } else {
-        if (error.name === "NotFoundError") {
-            console.warn("No device selected or available. Retrying...");
-        } else {
-            console.error("Unexpected error in GetMouse:", error);
-        }
-        throw error;
     }
-};
-async function GetBattery() {
+    throw new Error("No Razer device found");
+}
+
+async function sendCommand(msg) {
+    // Helper to send a command and get response
+    const mouse = await getMouse();
+
+    await mouse.open();
+
+    if (mouse.configuration === null) {
+        await mouse.selectConfiguration(1);
+    }
+
+    await mouse.claimInterface(mouse.configuration.interfaces[0].interfaceNumber);
+
+    await mouse.controlTransferOut({
+        requestType: 'class',
+        recipient: 'interface',
+        request: 0x09,
+        value: 0x300,
+        index: 0x00
+    }, msg);
+
+    await new Promise(res => setTimeout(res, 500));
+
+    const reply = await mouse.controlTransferIn({
+        requestType: 'class',
+        recipient: 'interface',
+        request: 0x01,
+        value: 0x300,
+        index: 0x00
+    }, 90);
+
+    await mouse.close();
+
+    return reply;
+}
+
+// Combined function to get both battery and charge state in one device session
+async function getDeviceStatus() {
+    // Simple mutex to prevent concurrent access
+    if (deviceLock) {
+        return null;
+    }
+    
+    deviceLock = true;
+    
     try {
-        const mouse = await GetMouse();
-
-        const msg = GetMessage(mouse);
-
+        const mouse = await getMouse();
+        const productInfo = RazerProducts[mouse.productId];
+        
         await mouse.open();
 
         if (mouse.configuration === null) {
-            await mouse.selectConfiguration(1)
+            await mouse.selectConfiguration(1);
         }
 
         await mouse.claimInterface(mouse.configuration.interfaces[0].interfaceNumber);
 
-        const request = await mouse.controlTransferOut({
+        // Get battery level
+        const batteryMsg = getMessage(productInfo.transactionId);
+        await mouse.controlTransferOut({
             requestType: 'class',
             recipient: 'interface',
             request: 0x09,
             value: 0x300,
             index: 0x00
-        }, msg)
+        }, batteryMsg);
 
         await new Promise(res => setTimeout(res, 500));
 
-        const reply = await mouse.controlTransferIn({
+        const batteryReply = await mouse.controlTransferIn({
             requestType: 'class',
             recipient: 'interface',
             request: 0x01,
             value: 0x300,
             index: 0x00
-        }, 90)
+        }, 90);
 
-        return (reply.data.getUint8(9) / 255 * 100).toFixed(1);
+        const batteryLevel = (batteryReply.data.getUint8(9) / 255 * 100).toFixed(1);
+
+        // Get charge state
+        const chargeMsg = getChargeStateMessage(productInfo.transactionId);
+        await mouse.controlTransferOut({
+            requestType: 'class',
+            recipient: 'interface',
+            request: 0x09,
+            value: 0x300,
+            index: 0x00
+        }, chargeMsg);
+
+        await new Promise(res => setTimeout(res, 500));
+
+        const chargeReply = await mouse.controlTransferIn({
+            requestType: 'class',
+            recipient: 'interface',
+            request: 0x01,
+            value: 0x300,
+            index: 0x00
+        }, 90);
+
+        const isCharging = chargeReply.data.getUint8(9) === 1;
+
+        await mouse.close();
+
+        return { batteryLevel, isCharging };
     } catch (error) {
-        if (error.message.includes("LIBUSB_ERROR_NO_DEVICE")) {
-            console.warn("Device disconnected during GetBattery. Retrying...");
+        if (error.message?.includes("LIBUSB_ERROR_NO_DEVICE")) {
+            console.warn("Device disconnected. Will retry...");
+        } else if (error.name === "NotFoundError") {
+            console.warn("No device found. Will retry...");
         } else {
-            console.error("Unexpected error in GetBattery:", error);
+            console.error("Error getting device status:", error.message);
         }
-        return undefined;
+        return null;
+    } finally {
+        deviceLock = false;
     }
-};
+}
 
-const matchDevicePath = (path, pid) => {
-    return (
-        path.includes(`VID_1532`) &&
-        path.includes(`PID_${pid}`) &&
-        path.includes("MI_01") &&
-        path.includes("Col05")
-    );
+// Legacy function for backwards compatibility
+async function getBattery() {
+    const status = await getDeviceStatus();
+    if (status) {
+        chargeState = status.isCharging;
+        return status.batteryLevel;
+    }
+    return undefined;
 }
 
 const monitorChargeState = () => {
-    let device;
-    let retryInterval;
-    let retryDelay = 5000; // Initial retry delay (5 seconds)
-    const maxRetryDelay = 60000; // Max retry delay (1 minute)
-
-    const connectToDevice = () => {
-        try {
-            const devices = HID.devices();
-            const targetDeviceInfo = devices.find((device) => {
-                const pid = Object.keys(RazerProducts).find((pidKey) => {
-                    const hexPid = `${parseInt(pidKey).toString(16).padStart(4, "0").toUpperCase()}`;
-                    return matchDevicePath(device.path, hexPid.toString());
-                });
-                return !!pid;
-            });
-
-            if (!targetDeviceInfo) {
-                console.log("No matching Razer device found. Retrying...");
-                throw new Error("Device not found");
+    const checkAndUpdate = async () => {
+        const status = await getDeviceStatus();
+        
+        if (status) {
+            const stateChanged = chargeState !== status.isCharging;
+            chargeState = status.isCharging;
+            
+            if (stateChanged) {
+                console.log("Charge state changed:", chargeState ? "Charging" : "Not charging");
             }
-
-            device = new HID.HID(targetDeviceInfo.path);
-            console.log("Connected to device:", targetDeviceInfo.product);
-
-            // Reset retry delay on successful connection
-            retryDelay = 5000;
-
-            device.on("data", (data) => {
-                const chargingStateBit = data[2];
-                const newChargeState = chargingStateBit === 1;
-
-                if (chargeState !== newChargeState) {
-                    chargeState = newChargeState;
-                    SetTrayDetails(tray, chargeState);
-                }
-            });
-
-            device.on("error", (err) => {
-                if (err.message.includes("could not read from HID device")) {
-                    console.warn("Device disconnected. Retrying...");
-                } else {
-                    console.error("Unexpected HID device error:", err);
-                }
-                chargeState = false; // Reset charge state
-                SetTrayDetails(tray, chargeState);
-                retryConnection();
-            });
-        } catch (error) {
-            if (error.message === "Device not found") {
-                console.warn("Retrying device connection...");
-            } else {
-                console.error("Unexpected error during device connection:", error);
-            }
-            retryConnection();
+            
+            // Update tray with both battery and charge state
+            const assetPath = getBatteryIconPath(status.batteryLevel, status.isCharging);
+            tray.setImage(nativeImage.createFromPath(path.join(rootPath, assetPath)));
+            tray.setToolTip(`${status.batteryLevel}%${status.isCharging ? ' (Charging)' : ''}`);
         }
     };
 
-    const retryConnection = () => {
-        if (retryInterval) clearTimeout(retryInterval);
-
-        // Ensure retry delay does not exceed max limit
-        retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
-
-        console.log(`Retrying connection in ${retryDelay / 1000} seconds...`);
-        retryInterval = setTimeout(connectToDevice, retryDelay);
-    };
-
-    connectToDevice();
+    // Poll every 15 seconds (combined battery + charge state)
+    chargeMonitorInterval = setInterval(checkAndUpdate, 15000);
 };
